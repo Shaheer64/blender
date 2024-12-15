@@ -2,254 +2,164 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
 
-/** \file
- * \ingroup bli
- */
-
-#include <stdlib.h> /* abort() */
-#include <string.h>
-
-#include "BLI_utildefines.h"
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+#include "BLI_stack.h"
 #include "MEM_guardedalloc.h"
 
-#include "BLI_stack.h" /* own include */
+class StackChunk {
+public:
+    StackChunk *next;
+    std::vector<char> data;
 
-#include "BLI_strict_flags.h" /* Keep last. */
-
-#define USE_TOTELEM
-
-#define CHUNK_EMPTY ((size_t)-1)
-/* target chunks size: 64kb */
-#define CHUNK_SIZE_DEFAULT (1 << 16)
-/* ensure we get at least this many elems per chunk */
-#define CHUNK_ELEM_MIN 32
-
-struct StackChunk {
-  struct StackChunk *next;
-  char data[0];
+    StackChunk(size_t chunk_size) : next(nullptr), data(chunk_size) {}
 };
 
-struct BLI_Stack {
-  struct StackChunk *chunk_curr; /* currently active chunk */
-  struct StackChunk *chunk_free; /* free chunks */
-  size_t chunk_index;            /* index into 'chunk_curr' */
-  size_t chunk_elem_max;         /* number of elements per chunk */
-  size_t elem_size;
-#ifdef USE_TOTELEM
-  size_t elem_num;
-#endif
+class BLI_StackImpl {
+public:
+    StackChunk *chunk_curr;
+    StackChunk *chunk_free;
+    size_t chunk_index;
+    size_t chunk_elem_max;
+    size_t elem_size;
+    size_t elem_num;
+
+    BLI_StackImpl(size_t elem_size, size_t chunk_size)
+        : chunk_curr(nullptr),
+          chunk_free(nullptr),
+          chunk_index(chunk_size - 1),
+          chunk_elem_max(chunk_size),
+          elem_size(elem_size),
+          elem_num(0) {}
+
+    ~BLI_StackImpl() {
+        clear_chunks(chunk_curr);
+        clear_chunks(chunk_free);
+    }
+
+    void *push_r() {
+        if (++chunk_index == chunk_elem_max) {
+            allocate_new_chunk();
+            chunk_index = 0;
+        }
+        elem_num++;
+        return get_last_elem();
+    }
+
+    void push(const void *src) {
+        void *dst = push_r();
+        std::memcpy(dst, src, elem_size);
+    }
+
+    void pop(void *dst) {
+        std::memcpy(dst, get_last_elem(), elem_size);
+        discard();
+    }
+
+    void *peek() {
+        return get_last_elem();
+    }
+
+    void discard() {
+        if (--chunk_index == SIZE_MAX) {
+            auto *old_chunk = chunk_curr;
+            chunk_curr = chunk_curr->next;
+            old_chunk->next = chunk_free;
+            chunk_free = old_chunk;
+            chunk_index = chunk_elem_max - 1;
+        }
+        elem_num--;
+    }
+
+    void clear() {
+        chunk_index = chunk_elem_max - 1;
+        if (chunk_free) {
+            if (chunk_curr) {
+                StackChunk *last_free = chunk_free;
+                while (last_free->next) {
+                    last_free = last_free->next;
+                }
+                last_free->next = chunk_curr;
+            }
+        } else {
+            chunk_free = chunk_curr;
+        }
+        chunk_curr = nullptr;
+        elem_num = 0;
+    }
+
+    size_t count() const { return elem_num; }
+
+    bool is_empty() const { return elem_num == 0; }
+
+private:
+    void *get_last_elem() {
+        return chunk_curr->data.data() + (elem_size * chunk_index);
+    }
+
+    void allocate_new_chunk() {
+        if (chunk_free) {
+            chunk_curr = chunk_free;
+            chunk_free = chunk_free->next;
+        } else {
+            chunk_curr = new StackChunk(elem_size * chunk_elem_max);
+        }
+        chunk_curr->next = nullptr;
+    }
+
+    void clear_chunks(StackChunk *chunk) {
+        while (chunk) {
+            StackChunk *next = chunk->next;
+            delete chunk;
+            chunk = next;
+        }
+    }
 };
 
-static void *stack_get_last_elem(BLI_Stack *stack)
-{
-  return ((char *)(stack)->chunk_curr->data) + ((stack)->elem_size * (stack)->chunk_index);
+// C Interface Wrappers
+extern "C" {
+BLI_Stack *BLI_stack_new_ex(size_t elem_size, const char * /*description*/, size_t chunk_size) {
+    return reinterpret_cast<BLI_Stack *>(new BLI_StackImpl(elem_size, chunk_size));
 }
 
-/**
- * \return number of elements per chunk, optimized for slop-space.
- */
-static size_t stack_chunk_elem_max_calc(const size_t elem_size, size_t chunk_size)
-{
-  /* get at least this number of elems per chunk */
-  const size_t elem_size_min = elem_size * CHUNK_ELEM_MIN;
-
-  BLI_assert((elem_size != 0) && (chunk_size != 0));
-
-  while (UNLIKELY(chunk_size <= elem_size_min)) {
-    chunk_size <<= 1;
-  }
-
-  /* account for slop-space */
-  chunk_size -= (sizeof(struct StackChunk) + MEM_SIZE_OVERHEAD);
-
-  return chunk_size / elem_size;
+BLI_Stack *BLI_stack_new(size_t elem_size, const char *description) {
+    return BLI_stack_new_ex(elem_size, description, 1 << 16);
 }
 
-BLI_Stack *BLI_stack_new_ex(const size_t elem_size,
-                            const char *description,
-                            const size_t chunk_size)
-{
-  BLI_Stack *stack = MEM_callocN(sizeof(*stack), description);
-
-  stack->chunk_elem_max = stack_chunk_elem_max_calc(elem_size, chunk_size);
-  stack->elem_size = elem_size;
-  /* force init */
-  stack->chunk_index = stack->chunk_elem_max - 1;
-
-  return stack;
+void BLI_stack_free(BLI_Stack *stack) {
+    delete reinterpret_cast<BLI_StackImpl *>(stack);
 }
 
-BLI_Stack *BLI_stack_new(const size_t elem_size, const char *description)
-{
-  return BLI_stack_new_ex(elem_size, description, CHUNK_SIZE_DEFAULT);
+void *BLI_stack_push_r(BLI_Stack *stack) {
+    return reinterpret_cast<BLI_StackImpl *>(stack)->push_r();
 }
 
-static void stack_free_chunks(struct StackChunk *data)
-{
-  while (data) {
-    struct StackChunk *data_next = data->next;
-    MEM_freeN(data);
-    data = data_next;
-  }
+void BLI_stack_push(BLI_Stack *stack, const void *src) {
+    reinterpret_cast<BLI_StackImpl *>(stack)->push(src);
 }
 
-void BLI_stack_free(BLI_Stack *stack)
-{
-  stack_free_chunks(stack->chunk_curr);
-  stack_free_chunks(stack->chunk_free);
-  MEM_freeN(stack);
+void BLI_stack_pop(BLI_Stack *stack, void *dst) {
+    reinterpret_cast<BLI_StackImpl *>(stack)->pop(dst);
 }
 
-void *BLI_stack_push_r(BLI_Stack *stack)
-{
-  stack->chunk_index++;
-
-  if (UNLIKELY(stack->chunk_index == stack->chunk_elem_max)) {
-    struct StackChunk *chunk;
-    if (stack->chunk_free) {
-      chunk = stack->chunk_free;
-      stack->chunk_free = chunk->next;
-    }
-    else {
-      chunk = MEM_mallocN(sizeof(*chunk) + (stack->elem_size * stack->chunk_elem_max), __func__);
-    }
-    chunk->next = stack->chunk_curr;
-    stack->chunk_curr = chunk;
-    stack->chunk_index = 0;
-  }
-
-  BLI_assert(stack->chunk_index < stack->chunk_elem_max);
-
-#ifdef USE_TOTELEM
-  stack->elem_num++;
-#endif
-
-  /* Return end of stack */
-  return stack_get_last_elem(stack);
+void *BLI_stack_peek(BLI_Stack *stack) {
+    return reinterpret_cast<BLI_StackImpl *>(stack)->peek();
 }
 
-void BLI_stack_push(BLI_Stack *stack, const void *src)
-{
-  void *dst = BLI_stack_push_r(stack);
-  memcpy(dst, src, stack->elem_size);
+void BLI_stack_discard(BLI_Stack *stack) {
+    reinterpret_cast<BLI_StackImpl *>(stack)->discard();
 }
 
-void BLI_stack_pop(BLI_Stack *stack, void *dst)
-{
-  BLI_assert(BLI_stack_is_empty(stack) == false);
-
-  memcpy(dst, stack_get_last_elem(stack), stack->elem_size);
-
-  BLI_stack_discard(stack);
+void BLI_stack_clear(BLI_Stack *stack) {
+    reinterpret_cast<BLI_StackImpl *>(stack)->clear();
 }
 
-void BLI_stack_pop_n(BLI_Stack *stack, void *dst, uint n)
-{
-  BLI_assert(n <= BLI_stack_count(stack));
-
-  while (n--) {
-    BLI_stack_pop(stack, dst);
-    dst = (void *)((char *)dst + stack->elem_size);
-  }
+size_t BLI_stack_count(const BLI_Stack *stack) {
+    return reinterpret_cast<const BLI_StackImpl *>(stack)->count();
 }
 
-void BLI_stack_pop_n_reverse(BLI_Stack *stack, void *dst, uint n)
-{
-  BLI_assert(n <= BLI_stack_count(stack));
-
-  dst = (void *)((char *)dst + (stack->elem_size * n));
-
-  while (n--) {
-    dst = (void *)((char *)dst - stack->elem_size);
-    BLI_stack_pop(stack, dst);
-  }
+bool BLI_stack_is_empty(const BLI_Stack *stack) {
+    return reinterpret_cast<const BLI_StackImpl *>(stack)->is_empty();
 }
-
-void *BLI_stack_peek(BLI_Stack *stack)
-{
-  BLI_assert(BLI_stack_is_empty(stack) == false);
-
-  return stack_get_last_elem(stack);
-}
-
-void BLI_stack_discard(BLI_Stack *stack)
-{
-  BLI_assert(BLI_stack_is_empty(stack) == false);
-
-#ifdef USE_TOTELEM
-  stack->elem_num--;
-#endif
-  if (UNLIKELY(--stack->chunk_index == CHUNK_EMPTY)) {
-    struct StackChunk *chunk_free;
-
-    chunk_free = stack->chunk_curr;
-    stack->chunk_curr = stack->chunk_curr->next;
-
-    chunk_free->next = stack->chunk_free;
-    stack->chunk_free = chunk_free;
-
-    stack->chunk_index = stack->chunk_elem_max - 1;
-  }
-}
-
-void BLI_stack_clear(BLI_Stack *stack)
-{
-#ifdef USE_TOTELEM
-  if (UNLIKELY(stack->elem_num == 0)) {
-    return;
-  }
-  stack->elem_num = 0;
-#else
-  if (UNLIKELY(stack->chunk_curr == NULL)) {
-    return;
-  }
-#endif
-
-  stack->chunk_index = stack->chunk_elem_max - 1;
-
-  if (stack->chunk_free) {
-    if (stack->chunk_curr) {
-      /* move all used chunks into tail of free list */
-      struct StackChunk *chunk_free_last = stack->chunk_free;
-      while (chunk_free_last->next) {
-        chunk_free_last = chunk_free_last->next;
-      }
-      chunk_free_last->next = stack->chunk_curr;
-      stack->chunk_curr = NULL;
-    }
-  }
-  else {
-    stack->chunk_free = stack->chunk_curr;
-    stack->chunk_curr = NULL;
-  }
-}
-
-size_t BLI_stack_count(const BLI_Stack *stack)
-{
-#ifdef USE_TOTELEM
-  return stack->elem_num;
-#else
-  struct StackChunk *data = stack->chunk_curr;
-  size_t elem_num = stack->chunk_index + 1;
-  size_t i;
-  if (elem_num != stack->chunk_elem_max) {
-    data = data->next;
-  }
-  else {
-    elem_num = 0;
-  }
-  for (i = 0; data; data = data->next) {
-    i++;
-  }
-  elem_num += stack->chunk_elem_max * i;
-  return elem_num;
-#endif
-}
-
-bool BLI_stack_is_empty(const BLI_Stack *stack)
-{
-#ifdef USE_TOTELEM
-  BLI_assert((stack->chunk_curr == NULL) == (stack->elem_num == 0));
-#endif
-  return (stack->chunk_curr == NULL);
 }
